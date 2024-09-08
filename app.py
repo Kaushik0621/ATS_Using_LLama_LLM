@@ -1,12 +1,15 @@
 import os
 import sqlite3
+import json
 from flask import Flask, render_template, request, redirect, url_for, session, flash
-from process_pdf import get_answers_for_questions  # Import the PDF processing logic
-from create_database import create_database  # Import the create_database function
+from process_pdf import process_pdf
+import PyPDF2  # For checking the number of pages in the PDF
 
 app = Flask(__name__)
 app.secret_key = 'your_secret_key'  # Secret key for session management
 UPLOAD_FOLDER = 'uploads/'
+MAX_FILE_SIZE_MB = 1  # Max file size allowed in MB
+MAX_PDF_PAGES = 3  # Max pages allowed in the PDF
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 DATABASE = 'database.db'
@@ -47,7 +50,35 @@ def update_submission_status(email):
 # Check if the database exists; if not, create it
 if not os.path.exists(DATABASE):
     print("Database does not exist. Creating database...")
-    create_database()
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL UNIQUE,
+        password TEXT NOT NULL,
+        submitted INTEGER DEFAULT 0
+    )
+    ''')
+    conn.commit()
+    conn.close()
+
+def allowed_file(filename):
+    """Check if the uploaded file is a PDF."""
+    return filename.lower().endswith('.pdf')
+
+def file_size_ok(file):
+    """Check if the uploaded file's size is less than or equal to 1MB."""
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)  # Reset file pointer
+    return file_size <= MAX_FILE_SIZE_MB * 1024 * 1024
+
+def check_pdf_page_count(file):
+    """Check if the PDF has more than 3 pages."""
+    reader = PyPDF2.PdfReader(file)
+    num_pages = len(reader.pages)
+    return num_pages <= MAX_PDF_PAGES
 
 @app.route("/", methods=["GET", "POST"])
 def login():
@@ -103,65 +134,51 @@ def upload_resume():
     if request.method == "POST":
         file = request.files['resume']
         if file.filename == '':
-            return "Please select a file."
+            flash("Please select a file.", "error")
+            return render_template("upload_resume.html", email=email)
         
-        if file and file.filename.endswith('.pdf'):
+        if file and allowed_file(file.filename):
+            # Check file size
+            if not file_size_ok(file):
+                flash("The file size exceeds 1 MB.", "error")
+                return render_template("upload_resume.html", email=email)
+
+            # Check number of pages in the PDF
+            if not check_pdf_page_count(file):
+                flash("The PDF contains more than 3 pages.", "error")
+                return render_template("upload_resume.html", email=email)
+            
+            # Save the file
             file_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
             file.save(file_path)
 
             # Process the PDF and get answers
-            result = get_answers_for_questions(file_path)
+            result = process_pdf(file_path)
+            
+            # Save result as JSON for display
+            with open("resume_data.json", "w") as json_file:
+                json.dump(result, json_file, indent=4)
             
             # Mark the user as having submitted
             update_submission_status(email)
             
-            # Pass extracted details to the show_answers page
-            return redirect(url_for('show_answers', **result))
+            # Redirect to show_answers page
+            return redirect(url_for('show_answers'))
     
-    return render_template("upload_resume.html", email=email)  # Render the resume upload form with email
+    return render_template("upload_resume.html", email=email)
 
 @app.route("/show_answers", methods=["GET", "POST"])
 def show_answers():
     """Display the answers extracted from the resume."""
+    # Load the JSON data from the file
+    with open("resume_data.json", "r") as json_file:
+        data = json.load(json_file)
+    
     if request.method == "POST":
-        # Handle form submission logic here, like saving the input data
+        # Handle form submission logic here
         return "Form submitted successfully!"
-
-    # Extracted information passed as query parameters
-    name = request.args.get('name', '')
-    pn_number = request.args.get('pn_number', '')
-
-    # Split education and work experience entries by semicolon for multiple institutions/experiences
-    education = request.args.get('education', '').split(";")  # This will be a list of educational entries
-    work_experience = request.args.get('work_experience', '').split(";")  # This will be a list of work experience entries
-    skills = request.args.get('skills', '')
-
-    return render_template("show_answers.html", name=name, pn_number=pn_number, 
-                           education=education, work_experience=work_experience, skills=skills)
-
-
-@app.route("/submit", methods=["POST"])
-def submit_form():
-    """Handle the form submission."""
-    name = request.form.get('name')
-    pn_number = request.form.get('pn_number')
-
-    # Get all education data
-    education_institutions = request.form.getlist('education_institution')
-    education_courses = request.form.getlist('education_course')
-    education_start_dates = request.form.getlist('education_start_date')
-    education_end_dates = request.form.getlist('education_end_date')
-
-    # Get all work experience data
-    work_organizations = request.form.getlist('work_organization')
-    work_roles = request.form.getlist('work_role')
-    work_start_dates = request.form.getlist('work_start_date')
-    work_end_dates = request.form.getlist('work_end_date')
-
-    # Process the collected data here...
-    # For example, saving the data to a database
-
-    return "Form submitted successfully!"
+    
+    return render_template("show_answers.html", data=data)
 
 if __name__ == "__main__":
     if not os.path.exists(UPLOAD_FOLDER):
